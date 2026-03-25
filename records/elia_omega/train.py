@@ -1,15 +1,20 @@
+# MIT License
+# Copyright (c) 2026 Igor Labadin
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
 """
 Elia ꙮ Omega v4.1: 24-Depth Recursive Monolith + Fibonacci Resonance + Depth HyperNet + 
                    Subconscious Cache + Octahedral Void Limit (√2-1 ≈ 0.414)
 
-SOTA Killer (цель — уверенно пробить 0.90 BPB и ниже)
-
-Что нового в v4.1:
-  - Octahedral Void Limit (void_limit = 0.41421356237) в subconscious_cache
-  - Это физически обоснованный коэффициент максимальной плотности упаковки сигнала
-    без разрушения residual stream (октаэдрическая пустота в ГЦК-решётке)
-  - Заменил эмпирический 0.05 → 0.414 → даёт +0.015…−0.025 BPB при минимальном риске
-  - Всё остальное из v4 сохранено 100%
+SOTA Killer for OpenAI Parameter Golf Challenge
+Limit constraints: 16MB artifact, 10-minute training on 8xH100.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
+
 try:
     import zstandard as zstd
     HAS_ZSTD = True
@@ -46,18 +52,22 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
+    
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
+    
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     val_stride = int(os.environ.get("VAL_STRIDE", 64))
+    
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 24))
@@ -68,16 +78,20 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 1000))
     qat_bits = int(os.environ.get("QAT_BITS", 6))
+    
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
     ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
+    
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -475,8 +489,7 @@ def _forward_with_partial_loss(
     emb_w = m.tok_emb.weight
     x0 = F.rms_norm(m.tok_emb(x), (emb_w.size(-1),))
 
-    # OCTAHEDRAL VOID LIMIT (√2 - 1) — максимальная плотность упаковки памяти
-    # без разрушения residual stream. Самая красивая и физически обоснованная константа.
+    # OCTAHEDRAL VOID LIMIT (√2 - 1)
     if subconscious_cache is not None:
         void_limit = 0.41421356237
         x0 = x0 + subconscious_cache * void_limit
@@ -514,21 +527,21 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, max_seq_len: int = 8192):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached: Tensor | None = None
-        self._sin_cached: Tensor | None = None
+        
+        # Предвычисляем углы заранее для обхода ошибки torch.compile
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer("cos_cached", freqs.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", freqs.sin()[None, None, :, :], persistent=False)
+
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (self._cos_cached is None or self._seq_len_cached != seq_len or self._cos_cached.device != device):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        cos = self.cos_cached[:, :, :seq_len, :].to(dtype=dtype, device=device)
+        sin = self.sin_cached[:, :, :seq_len, :].to(dtype=dtype, device=device)
+        return cos, sin
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
@@ -663,6 +676,8 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
+    
+    # 8xH100 Hardware limits
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import (
@@ -670,6 +685,7 @@ def main() -> None:
     )
     enable_cudnn_sdp(False); enable_flash_sdp(True)
     enable_mem_efficient_sdp(False); enable_math_sdp(False)
+    
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
@@ -681,6 +697,7 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+                
     random.seed(args.seed); np.random.seed(args.seed)
     torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -695,6 +712,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+    
     for module in base_model.modules():
         if isinstance(module, QATLinear):
             module.float()
@@ -705,6 +723,7 @@ def main() -> None:
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed else compiled_model
     )
+    
     block_named_params = list(base_model.block.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
@@ -714,6 +733,7 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": args.tied_embed_lr, "base_lr": args.tied_embed_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
@@ -730,10 +750,13 @@ def main() -> None:
     )
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    
     def zero_grad_all():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
+            
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -747,6 +770,7 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        
     if args.warmup_steps > 0:
         initial_model_state = {
             n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()
@@ -772,11 +796,13 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        
     training_time_ms = 0.0
     stop_after_step = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
+    
     while True:
         last_step = step == args.iterations or (
             stop_after_step is not None and step >= stop_after_step
@@ -802,12 +828,15 @@ def main() -> None:
                     p.data.copy_(live_state[n])
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            
         if last_step:
             break
+            
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -816,10 +845,12 @@ def main() -> None:
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            
         train_loss /= grad_accum_steps
         if args.qat_enabled and step == args.qat_start_step:
             enable_qat_on_model(base_model)
             log0(f"step:{step} — Int6 QAT enabled")
+            
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
@@ -832,8 +863,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        
         if ema is not None and step >= args.ema_start_step:
             ema.update(base_model)
+            
         step += 1
         approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.train_log_every > 0 and (
@@ -843,6 +876,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_ms:.0f}ms step_avg:{approx_ms / step:.2f}ms"
             )
+            
         reached_cap = max_wallclock_ms is not None and approx_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             rc = torch.tensor(int(reached_cap), device=device)
@@ -850,9 +884,11 @@ def main() -> None:
             reached_cap = bool(rc.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+            
     if ema is not None:
         ema.apply_to(base_model)
         log0("Applied EMA weights for final checkpoint")
+        
     quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
     log0(
         f"quant: {quant_stats['param_count']:,} params | "
@@ -867,8 +903,10 @@ def main() -> None:
         with open(artifact_name, "wb") as f:
             f.write(quant_blob)
         log0(f"Artifact size: {len(quant_blob)/1e6:.3f} MB ({artifact_name})")
+        
     if distributed:
         dist.barrier()
+        
     with open(artifact_name, "rb") as f:
         quant_blob_disk = f.read()
     restored = dequantize_state_dict_int6(
@@ -881,6 +919,7 @@ def main() -> None:
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     log0(f"final_int6_roundtrip val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    
     if distributed:
         dist.destroy_process_group()
 
