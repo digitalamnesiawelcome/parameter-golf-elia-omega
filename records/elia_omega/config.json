@@ -1,0 +1,52 @@
+{
+  "model_name": "Elia Omega v4.1 (SOTA Killer)",
+  "architecture_type": "Recursive Monolith",
+  "hardware_target": "8xH100",
+  "max_compute_time_seconds": 600.0,
+  "parameter_size_limit_mb": 16.0,
+  "dimensions": {
+    "vocab_size": 8192,
+    "num_layers_recurrent_depth": 24,
+    "model_dim": 1152,
+    "num_heads": 18,
+    "num_kv_heads": 6,
+    "mlp_mult": 4,
+    "head_dim": 64
+  },
+  "advanced_cognitive_features": {
+    "subconscious_cache_enabled": true,
+    "octahedral_void_limit": 0.41421356237,
+    "fibonacci_resonance_decay_base": 1.618033988749895,
+    "depth_hypernet_embedding_enabled": true
+  },
+  "regularization_and_stability": {
+    "tie_embeddings": true,
+    "rope_base": 10000.0,
+    "logit_softcap": 30.0,
+    "mlp_activation": "LeakyReLU(0.5)^2"
+  },
+  "quantization_and_compression": {
+    "qat_enabled": true,
+    "qat_start_step": 1000,
+    "qat_bits": 6,
+    "compression_algorithm": "zstandard (fallback: zlib)"
+  },
+  "optimization": {
+    "matrix_optimizer": "Muon",
+    "scalar_optimizer": "Adam",
+    "matrix_lr": 0.04,
+    "scalar_lr": 0.04,
+    "muon_momentum": 0.95,
+    "ema_enabled": true,
+    "ema_decay": 0.999
+  },
+  "training_hyperparameters": {
+    "val_batch_size": 524288,
+    "train_batch_tokens": 524288,
+    "train_seq_len": 1024,
+    "iterations_target": 20000,
+    "warmup_steps": 20,
+    "warmdown_iters": 1200,
+    "val_stride": 64
+  }
+}
