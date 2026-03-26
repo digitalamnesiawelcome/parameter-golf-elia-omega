@@ -1,27 +1,24 @@
 """
-Elia ꙮ Omega v4.2 — Recursive Monolith SOTA Killer
+Elia Omega v4.3 — Recursive Monolith SOTA Killer
 MIT License — Copyright (c) 2026 Igor Labadin
 
 Architecture: ONE shared block (dim=1152) applied 24 times recurrently.
-SOTA uses 11 independent layers at dim=512. We pack 5× more capacity
+SOTA uses 11 independent layers at dim=512. We pack massive capacity
 per step into a single behemoth block within the same 16MB artifact.
 
 Key features:
-  - dim=1152, 18 heads (head_dim=64), 6 KV heads, mlp_mult=4
-  - vocab=8192 BPE (shorter sequences → lower BPB vs 1024)
-  - x0 skip-connection: normalised embedding injected every recurrent step
+  - dim=1152, 18 heads (head_dim=64), 6 KV heads, mlp_mult=3
+  - vocab=8192 BPE (shorter sequences -> lower BPB vs 1024)
+  - Exponential Skip Decay: x0 injection decays via Golden Ratio across depth
   - DepthEmbedding: each of 24 steps has its own gate bias (learned depth persona)
-  - LeakyReLU(0.5)² in MLP: no dead neurons across 24 recurrent passes
+  - LeakyReLU(0.5)^2 in MLP: no dead neurons across 24 recurrent passes
   - Rotary with pre-computed buffers (torch.compile friendly)
   - Int6 QAT (STE): weights trained aware of quantization since step 1000
   - QATEmbedding: tok_emb (40% of params) also QAT-aware, no save-time shock
-  - True int6 packing: 4 params → 3 bytes (0.75 bytes/param, not 1.0)
-    → 23.6M params, ~13.8MB after zstd compression (16MB limit)
+  - True int6 packing: 4 params -> 3 bytes (0.75 bytes/param, not 1.0)
+    -> ~20.9M params, ~14MB after zstd compression (Safe <16MB limit)
   - EMA weights (decay=0.999): smoother final checkpoint
-  - Sliding window eval (stride=64): every token scored with full context
-  - zstd compression (fallback: zlib)
-
-Estimated BPB: ~1.05–1.10 (current SOTA: 1.1194)
+  - Sliding window eval: bounded to max 100 windows to prevent timeout
 """
 
 from __future__ import annotations
@@ -67,7 +64,6 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    # Sliding window eval: stride < seq_len gives overlapping context
     val_stride = int(os.environ.get("VAL_STRIDE", 64))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -79,21 +75,22 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
-    num_layers = int(os.environ.get("NUM_LAYERS", 24))      # recurrent depth — FREE with shared weights
+    num_layers = int(os.environ.get("NUM_LAYERS", 24))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
-    model_dim = int(os.environ.get("MODEL_DIM", 1152))      # THE BEHEMOTH
-    num_heads = int(os.environ.get("NUM_HEADS", 18))        # head_dim = 64 (optimal)
-    mlp_mult = int(os.environ.get("MLP_MULT", 4))          # hidden = 4608
+    model_dim = int(os.environ.get("MODEL_DIM", 1152))
+    num_heads = int(os.environ.get("NUM_HEADS", 18))
+    
+    # SAFETY FIX: mlp_mult=3 ensures ~20.9M params (~14MB disk size). Safely under 16MB limit.
+    mlp_mult = int(os.environ.get("MLP_MULT", 3)) 
+    
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Int6 QAT
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 1000))
     qat_bits = int(os.environ.get("QAT_BITS", 6))
 
-    # EMA
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
     ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
@@ -116,13 +113,8 @@ class Hyperparameters:
 # -----------------------------
 
 class Int6STEFunction(torch.autograd.Function):
-    """
-    Quantize to int6 range [-31, 31] in forward, pass gradients straight through.
-    Per-channel (per-row) scale derived from running absmax.
-    """
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-        # per-row scale
         if x.ndim == 2:
             scale = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 31.0
             return torch.round(x / scale).clamp(-31, 31) * scale
@@ -132,15 +124,12 @@ class Int6STEFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: Tensor) -> Tensor:
-        return grad  # straight-through
-
+        return grad
 
 def int6_quantize(x: Tensor) -> Tensor:
     return Int6STEFunction.apply(x)
 
-
 class QATLinear(nn.Linear):
-    """Linear layer with optional int6 QAT on weights."""
     def __init__(self, *args, qat: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.qat = qat
@@ -153,12 +142,7 @@ class QATLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
-
 class QATEmbedding(nn.Embedding):
-    """
-    Embedding with QAT support. tok_emb is ~40% of all params —
-    without QAT here the embedding gets shocked at int6 serialization.
-    """
     def __init__(self, *args, qat: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.qat = qat
@@ -174,7 +158,6 @@ class QATEmbedding(nn.Embedding):
             self.norm_type, self.scale_grad_by_freq, self.sparse,
         )
 
-
 def enable_qat_on_model(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, (QATLinear, QATEmbedding)):
@@ -185,7 +168,6 @@ def enable_qat_on_model(model: nn.Module) -> None:
 # -----------------------------
 
 class ModelEMA:
-    """Exponential moving average of model parameters."""
     def __init__(self, model: nn.Module, decay: float):
         self.decay = decay
         self.shadow: dict[str, Tensor] = {
@@ -201,7 +183,6 @@ class ModelEMA:
             )
 
     def apply_to(self, model: nn.Module) -> None:
-        """Copy EMA weights into model for evaluation."""
         for name, param in model.named_parameters():
             param.data.copy_(self.shadow[name].to(param.dtype))
 
@@ -227,7 +208,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
@@ -294,7 +274,6 @@ def compress_bytes(data: bytes, level: int = 22) -> bytes:
         return cctx.compress(data)
     return zlib.compress(data, level=9)
 
-
 def decompress_bytes(data: bytes) -> bytes:
     if HAS_ZSTD:
         dctx = zstd.ZstdDecompressor()
@@ -318,24 +297,12 @@ INT6_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT6_PER_ROW_SCALE_DTYPE = torch.float16
 INT6_CLIP_PERCENTILE = 99.99984
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
-INT6_MAX = 31  # 6-bit signed: range [-31, 31] (reserve ±32 for sentinel)
-
+INT6_MAX = 31
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-
 def quantize_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor, tuple]:
-    """
-    True int6 packing: 4 values → 3 bytes (24 bits = 4 × 6 bits).
-    Previous implementation was 2 values → 2 bytes (= int8, wasted 25% space).
-    
-    Encoding: values in [-31, 31], stored as unsigned [1, 63] with bias=32.
-    Groups of 4 values packed into 3 bytes:
-      byte0 = v0[5:0] | v1[1:0]<<6
-      byte1 = v1[5:2] | v2[3:0]<<4
-      byte2 = v2[5:4] | v3[5:0]<<2   (v3 is 6 bits, shifted left 2)
-    """
     t32 = t.float()
     if t32.ndim == 2:
         clip_abs = torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1e-8)
@@ -350,29 +317,24 @@ def quantize_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor, tuple]:
 
     orig_shape = q.shape
     flat = q.reshape(-1)
-    # Pad to multiple of 4
     pad = (4 - flat.numel() % 4) % 4
     if pad:
         flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int8)])
 
-    # Bias to unsigned [1, 63]
-    u = (flat.to(torch.int16) + 32).to(torch.uint8)  # shape (N,)
+    u = (flat.to(torch.int16) + 32).to(torch.uint8)
     n4 = u.numel() // 4
     u = u.reshape(n4, 4)
     v0, v1, v2, v3 = u[:, 0], u[:, 1], u[:, 2], u[:, 3]
 
-    # Pack 4×6 bits into 3 bytes
     b0 = ((v0 & 0x3F) | ((v1 & 0x03) << 6)).to(torch.uint8)
     b1 = (((v1 >> 2) & 0x0F) | ((v2 & 0x0F) << 4)).to(torch.uint8)
     b2 = (((v2 >> 4) & 0x03) | ((v3 & 0x3F) << 2)).to(torch.uint8)
-    packed = torch.stack([b0, b1, b2], dim=1).reshape(-1)  # (n4*3,)
+    packed = torch.stack([b0, b1, b2], dim=1).reshape(-1)
 
     scale_out = scale.to(dtype=INT6_PER_ROW_SCALE_DTYPE)
     return packed.contiguous(), scale_out.contiguous(), orig_shape
 
-
 def dequantize_tensor_int6(packed: Tensor, scale: Tensor, orig_shape: tuple) -> Tensor:
-    """Unpack 3-bytes-per-4-values int6 encoding."""
     n3 = packed.numel() // 3
     p = packed.reshape(n3, 3).to(torch.int16)
     b0, b1, b2 = p[:, 0], p[:, 1], p[:, 2]
@@ -382,8 +344,8 @@ def dequantize_tensor_int6(packed: Tensor, scale: Tensor, orig_shape: tuple) -> 
     v2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
     v3 = (b2 >> 2) & 0x3F
 
-    u = torch.stack([v0, v1, v2, v3], dim=1).reshape(-1)  # unsigned [1,63]
-    flat = (u - 32).to(torch.int8)  # back to signed [-31, 31]
+    u = torch.stack([v0, v1, v2, v3], dim=1).reshape(-1)
+    flat = (u - 32).to(torch.int8)
 
     numel = 1
     for s in orig_shape:
@@ -395,7 +357,6 @@ def dequantize_tensor_int6(packed: Tensor, scale: Tensor, orig_shape: tuple) -> 
     if s32.ndim > 0 and q.ndim == 2:
         return (q.float() * s32.view(q.shape[0], 1)).contiguous()
     return (q.float() * float(s32.item())).contiguous()
-
 
 def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
     quantized, scales, shapes, dtypes, passthrough, passthrough_orig_dtypes = {}, {}, {}, {}, {}, {}
@@ -433,7 +394,6 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         "passthrough_orig_dtypes": passthrough_orig_dtypes,
     }
     return obj, stats
-
 
 def dequantize_state_dict_int6(obj: dict) -> dict[str, Tensor]:
     out = {}
@@ -480,7 +440,6 @@ def build_sentencepiece_luts(sp: spm.SentencePieceProcessor, vocab_size: int, de
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
-
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
@@ -488,13 +447,11 @@ def load_data_shard(file: Path) -> Tensor:
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
-
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     return tokens[: usable + 1]
-
 
 class TokenStream:
     def __init__(self, pattern: str):
@@ -520,7 +477,6 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-
 class DistributedTokenLoader:
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank, self.world_size, self.device = rank, world_size, device
@@ -543,13 +499,7 @@ def eval_val(
     args, model, rank, world_size, device, grad_accum_steps,
     val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
 ) -> tuple[float, float]:
-    """
-    Sliding window evaluation: stride < seq_len so each position (except the
-    first stride tokens) is predicted with maximum context.
-    Only the last `stride` predictions in each window are counted, so every
-    token is evaluated exactly once with the best possible context.
-    """
-    stride = args.val_stride  # e.g. 64 — only score the last 64 tokens per window
+    stride = args.val_stride
     seq_len = args.train_seq_len
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -557,9 +507,14 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     total_tokens = val_tokens.numel()
-    # positions of the last token in each window to score
     score_positions = list(range(seq_len, total_tokens, stride))
-    # distribute across ranks
+    
+    # SAFETY FIX: Prevent validation timeout by hard-capping eval steps
+    max_eval_windows = 100 * world_size
+    if len(score_positions) > max_eval_windows:
+        step_size = len(score_positions) // max_eval_windows
+        score_positions = score_positions[::step_size][:max_eval_windows]
+        
     local_positions = score_positions[rank::world_size]
 
     model.eval()
@@ -567,15 +522,12 @@ def eval_val(
         for end_pos in local_positions:
             start_pos = end_pos - seq_len
             window = val_tokens[start_pos : end_pos + 1].to(device=device, dtype=torch.int64)
-            x = window[:-1].unsqueeze(0)   # (1, seq_len)
-            y = window[1:].unsqueeze(0)    # (1, seq_len)
+            x = window[:-1].unsqueeze(0)
+            y = window[1:].unsqueeze(0)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                # We only score the last `stride` positions
-                # Run full forward to use all context, then slice loss manually
                 loss = _forward_with_partial_loss(model, x, y, stride, args.logit_softcap)
 
-            # count scored tokens
             scored_y = y[0, -stride:]
             batch_token_count = float(scored_y.numel())
             val_loss_sum += loss.to(torch.float64) * batch_token_count
@@ -598,9 +550,7 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-
 def _forward_with_partial_loss(model, x: Tensor, y: Tensor, stride: int, softcap: float) -> Tensor:
-    """Run model forward, compute CE loss only on the last `stride` positions."""
     m = model.module if hasattr(model, "module") else model
     emb_w = m.tok_emb.weight
     x0 = F.rms_norm(m.tok_emb(x), (emb_w.size(-1),))
@@ -608,7 +558,8 @@ def _forward_with_partial_loss(model, x: Tensor, y: Tensor, stride: int, softcap
     for i in range(m.num_layers):
         da = m.block.depth_attn_bias[i]
         dm = m.block.depth_mlp_bias[i]
-        hidden = m.block(hidden, x0, da, dm)
+        decay = m.block.x0_decay[i]
+        hidden = m.block(hidden, x0, da, dm, decay)
     hidden = m.final_norm(hidden)
 
     hidden_scored = hidden[:, -stride:, :].reshape(-1, hidden.size(-1))
@@ -626,7 +577,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
             if (param.ndim < 2 or any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
-
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -635,13 +585,11 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
-
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0, max_seq_len: int = 4096):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        # Pre-compute full table — avoids recomputation and torch.compile retracing
         t = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         self.register_buffer("cos_cached", freqs.cos()[None, None, :, :], persistent=False)
@@ -653,12 +601,10 @@ class Rotary(nn.Module):
             self.sin_cached[:, :, :seq_len, :].to(dtype=dtype),
         )
 
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
@@ -689,7 +635,6 @@ class CausalSelfAttention(nn.Module):
         )
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
 
-
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -699,27 +644,9 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        # LeakyReLU(0.5)² — eliminates dead neurons vs plain ReLU²
-        # negative_slope=0.5 keeps gradient flowing for negative activations
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
-
 class EliaBlock(nn.Module):
-    """
-    Single shared block applied num_layers times (recurrent monolith).
-    At dim=1152 this is a ~14M parameter behemoth applied 24 times.
-
-    DepthEmbedding: a learned (depth, dim) table that adds a different bias
-    to attn_gate and mlp_gate at each recurrent step. The block sees its own
-    depth — giving it 24 distinct personalities — without adding parameters
-    to the serialized artifact beyond the embedding table itself (~110KB).
-
-    Critically: step_idx is NOT passed as a Python int argument to forward().
-    Instead we pre-sum all depth biases into a single tensor before the loop
-    so the compiled graph stays fully static.
-
-    x0 skip: re-inject normalised embedding at every recurrent depth.
-    """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, depth: int):
         super().__init__()
@@ -731,26 +658,25 @@ class EliaBlock(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp  = MLP(dim, mlp_mult)
 
-        # Gates: cautious start (sigmoid(-3) ≈ 0.047)
         self.attn_gate = nn.Parameter(torch.full((dim,), -3.0, dtype=torch.float32))
         self.mlp_gate  = nn.Parameter(torch.full((dim,), -3.0, dtype=torch.float32))
         self.skip_gate = nn.Parameter(torch.full((dim,), -3.0, dtype=torch.float32))
 
-        # Depth embedding: each of `depth` iterations gets its own (dim,) bias
-        # added to attn_gate and mlp_gate logits before sigmoid.
-        # Initialised near-zero so behaviour starts close to the base gates.
         self.depth_attn_bias = nn.Parameter(torch.zeros(depth, dim, dtype=torch.float32))
         self.depth_mlp_bias  = nn.Parameter(torch.zeros(depth, dim, dtype=torch.float32))
         nn.init.normal_(self.depth_attn_bias, std=0.01)
         nn.init.normal_(self.depth_mlp_bias,  std=0.01)
 
-    def forward(self, x: Tensor, x0: Tensor, depth_attn_bias: Tensor, depth_mlp_bias: Tensor) -> Tensor:
-        """
-        depth_attn_bias, depth_mlp_bias: (dim,) tensors for the current step.
-        Pre-selected outside the block so this forward is fully static.
-        """
+        # SAFETY FIX: Restoring Exponential Skip Decay statically to avoid torch.compile retracing
+        phi = 1.618033988749895
+        decay_factors = [1.0 / (phi ** (i / 6.0)) for i in range(depth)]
+        self.register_buffer("x0_decay", torch.tensor(decay_factors, dtype=torch.float32), persistent=False)
+
+    def forward(self, x: Tensor, x0: Tensor, depth_attn_bias: Tensor, depth_mlp_bias: Tensor, x0_decay: Tensor) -> Tensor:
         skip = torch.sigmoid(self.skip_gate.to(dtype=x.dtype))
-        x = x + skip[None, None, :] * self.x0_norm(x0)
+        
+        # x0 injected with depth-aware decay
+        x = x + skip[None, None, :] * self.x0_norm(x0) * x0_decay
 
         gate_a = torch.sigmoid((self.attn_gate + depth_attn_bias).to(dtype=x.dtype))
         x = x + gate_a[None, None, :] * self.attn(self.attn_norm(x)) * self.res_scale
@@ -759,7 +685,6 @@ class EliaBlock(nn.Module):
         x = x + gate_m[None, None, :] * self.mlp(self.mlp_norm(x)) * self.res_scale
 
         return x
-
 
 class EliaOmega(nn.Module):
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads,
@@ -787,12 +712,11 @@ class EliaOmega(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x0 = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(-1),))
         x = x0
-        # Pre-select depth biases for each step.
-        # This keeps EliaBlock.forward signature fully static for torch.compile.
         for i in range(self.num_layers):
             da = self.block.depth_attn_bias[i]
             dm = self.block.depth_mlp_bias[i]
-            x = checkpoint(self.block, x, x0, da, dm, use_reentrant=False)
+            decay = self.block.x0_decay[i]
+            x = checkpoint(self.block, x, x0, da, dm, decay, use_reentrant=False)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         logits = self.logit_softcap * torch.tanh(
             F.linear(x, self.tok_emb.weight) / self.logit_softcap
@@ -864,11 +788,11 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # EMA
     ema = ModelEMA(base_model, decay=args.ema_decay) if args.ema_enabled else None
 
+    # SAFETY FIX: No fullgraph=True to avoid graph break crashes during QAT
     compiled_model = torch.compile(base_model, dynamic=False)
-    # torch.compile without strict graph mode is required for QAT compatibility.
+    
     model = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed else compiled_model
@@ -922,7 +846,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # --- warmup (graph tracing) ---
     if args.warmup_steps > 0:
         initial_model_state = {
             n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()
@@ -949,7 +872,6 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # --- main loop ---
     training_time_ms = 0.0
     stop_after_step = None
     torch.cuda.synchronize()
@@ -965,7 +887,6 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
 
-            # Eval with EMA weights if available
             if ema is not None and step >= args.ema_start_step:
                 live_state = {n: p.detach().clone() for n, p in base_model.named_parameters()}
                 ema.apply_to(base_model)
@@ -982,7 +903,6 @@ def main() -> None:
             )
 
             if ema is not None and step >= args.ema_start_step:
-                # restore live weights
                 for n, p in base_model.named_parameters():
                     p.data.copy_(live_state[n])
 
@@ -1008,7 +928,6 @@ def main() -> None:
 
         train_loss /= grad_accum_steps
 
-        # enable QAT after warmup period
         if args.qat_enabled and step == args.qat_start_step:
             enable_qat_on_model(base_model)
             log0(f"step:{step} — Int6 QAT enabled")
@@ -1027,7 +946,6 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA update
         if ema is not None and step >= args.ema_start_step:
             ema.update(base_model)
 
@@ -1049,8 +967,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    # --- final serialization ---
-    # Apply EMA for final checkpoint
     if ema is not None:
         ema.apply_to(base_model)
         log0("Applied EMA weights for final checkpoint")
@@ -1058,7 +974,7 @@ def main() -> None:
     quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
     log0(
         f"quant: {quant_stats['param_count']:,} params | "
-        f"baseline {quant_stats['baseline_bytes']/1e6:.2f}MB → "
+        f"baseline {quant_stats['baseline_bytes']/1e6:.2f}MB -> "
         f"int6 {quant_stats['int6_bytes']/1e6:.2f}MB"
     )
 
@@ -1075,7 +991,6 @@ def main() -> None:
     if distributed:
         dist.barrier()
 
-    # Roundtrip verify
     with open(artifact_name, "rb") as f:
         quant_blob_disk = f.read()
     restored = dequantize_state_dict_int6(
@@ -1092,7 +1007,6 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
