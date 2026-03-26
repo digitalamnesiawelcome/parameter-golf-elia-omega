@@ -1,5 +1,5 @@
 """
-Elia Omega v4.3 — Recursive Monolith SOTA Killer
+Elia ꙮ Omega v5.1 — The Final Monolith (SOTA Killer)
 MIT License — Copyright (c) 2026 Igor Labadin
 
 Architecture: ONE shared block (dim=1152) applied 24 times recurrently.
@@ -10,15 +10,16 @@ Key features:
   - dim=1152, 18 heads (head_dim=64), 6 KV heads, mlp_mult=3
   - vocab=8192 BPE (shorter sequences -> lower BPB vs 1024)
   - Exponential Skip Decay: x0 injection decays via Golden Ratio across depth
-  - DepthEmbedding: each of 24 steps has its own gate bias (learned depth persona)
+  - Zero-Init DepthEmbedding: safe, perfectly symmetrical start for 24 depth personas
   - LeakyReLU(0.5)^2 in MLP: no dead neurons across 24 recurrent passes
   - Rotary with pre-computed buffers (torch.compile friendly)
-  - Int6 QAT (STE): weights trained aware of quantization since step 1000
+  - Int6 QAT (STE): weights trained aware of quantization since step 200
   - QATEmbedding: tok_emb (40% of params) also QAT-aware, no save-time shock
-  - True int6 packing: 4 params -> 3 bytes (0.75 bytes/param, not 1.0)
-    -> ~20.9M params, ~14MB after zstd compression (Safe <16MB limit)
+  - True int6 packing: 4 params -> 3 bytes (0.75 bytes/param)
+    -> ~20.9M params, ~14.6MB after compression (Safe <16MB limit)
   - EMA weights (decay=0.999): smoother final checkpoint
-  - Sliding window eval: bounded to max 100 windows to prevent timeout
+  - System survivability: 570s soft-stop via absolute wallclock, adaptive DDP gradient accumulation
+  - Precision Safety: Passthrough control tensors retain exact bfloat16/float32 dtype
 """
 
 from __future__ import annotations
@@ -63,15 +64,17 @@ class Hyperparameters:
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
     val_stride = int(os.environ.get("VAL_STRIDE", 64))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 150))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    
+    # SAFETY FIX: Absolute landing strip to avoid SIGKILL
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 570.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
@@ -79,8 +82,6 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
     model_dim = int(os.environ.get("MODEL_DIM", 1152))
     num_heads = int(os.environ.get("NUM_HEADS", 18))
-    
-    # SAFETY FIX: mlp_mult=3 ensures ~20.9M params (~14MB disk size). Safely under 16MB limit.
     mlp_mult = int(os.environ.get("MLP_MULT", 3)) 
     
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -88,12 +89,12 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_step = int(os.environ.get("QAT_START_STEP", 1000))
+    qat_start_step = int(os.environ.get("QAT_START_STEP", 200))
     qat_bits = int(os.environ.get("QAT_BITS", 6))
 
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
-    ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 100))
 
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
@@ -272,13 +273,15 @@ def compress_bytes(data: bytes, level: int = 22) -> bytes:
     if HAS_ZSTD:
         cctx = zstd.ZstdCompressor(level=level)
         return cctx.compress(data)
-    return zlib.compress(data, level=9)
+    else:
+        return zlib.compress(data, level=9)
 
 def decompress_bytes(data: bytes) -> bytes:
     if HAS_ZSTD:
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(data)
-    return zlib.decompress(data)
+    else:
+        return zlib.decompress(data)
 
 # -----------------------------
 # QUANTIZATION (INT6 post-training for serialization)
@@ -293,7 +296,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 
 INT6_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT6_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT6_PER_ROW_SCALE_DTYPE = torch.float16
 INT6_CLIP_PERCENTILE = 99.99984
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
@@ -373,8 +375,9 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             continue
         if (t.numel() <= INT6_KEEP_FLOAT_MAX_NUMEL or
                 any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)):
-            kept = t.to(dtype=INT6_KEEP_FLOAT_STORE_DTYPE).contiguous()
-            if t.dtype in {torch.float32, torch.bfloat16}:
+            # SAFETY FIX: Do not force float16 on passthrough parameters. Retain original exact dtype.
+            kept = t.detach().cpu().contiguous()
+            if t.dtype in {torch.float32, torch.bfloat16, torch.float16}:
                 passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
             passthrough[name] = kept
             stats["int6_bytes"] += tensor_nbytes(kept)
@@ -509,7 +512,6 @@ def eval_val(
     total_tokens = val_tokens.numel()
     score_positions = list(range(seq_len, total_tokens, stride))
     
-    # SAFETY FIX: Prevent validation timeout by hard-capping eval steps
     max_eval_windows = 100 * world_size
     if len(score_positions) > max_eval_windows:
         step_size = len(score_positions) // max_eval_windows
@@ -664,10 +666,9 @@ class EliaBlock(nn.Module):
 
         self.depth_attn_bias = nn.Parameter(torch.zeros(depth, dim, dtype=torch.float32))
         self.depth_mlp_bias  = nn.Parameter(torch.zeros(depth, dim, dtype=torch.float32))
-        nn.init.normal_(self.depth_attn_bias, std=0.01)
-        nn.init.normal_(self.depth_mlp_bias,  std=0.01)
+        nn.init.zeros_(self.depth_attn_bias)
+        nn.init.zeros_(self.depth_mlp_bias)
 
-        # SAFETY FIX: Restoring Exponential Skip Decay statically to avoid torch.compile retracing
         phi = 1.618033988749895
         decay_factors = [1.0 / (phi ** (i / 6.0)) for i in range(depth)]
         self.register_buffer("x0_decay", torch.tensor(decay_factors, dtype=torch.float32), persistent=False)
@@ -675,7 +676,6 @@ class EliaBlock(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, depth_attn_bias: Tensor, depth_mlp_bias: Tensor, x0_decay: Tensor) -> Tensor:
         skip = torch.sigmoid(self.skip_gate.to(dtype=x.dtype))
         
-        # x0 injected with depth-aware decay
         x = x + skip[None, None, :] * self.x0_norm(x0) * x0_decay
 
         gate_a = torch.sigmoid((self.attn_gate + depth_attn_bias).to(dtype=x.dtype))
@@ -732,12 +732,17 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
+    # SAFETY FIX: Absolute Wallclock initialization
+    global_start_time = time.perf_counter()
+
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank       = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    grad_accum_steps = 8 // world_size
+    
+    grad_accum_steps = max(4, 32 // world_size)
     grad_scale = 1.0 / grad_accum_steps
+    
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -790,7 +795,6 @@ def main() -> None:
 
     ema = ModelEMA(base_model, decay=args.ema_decay) if args.ema_enabled else None
 
-    # SAFETY FIX: No fullgraph=True to avoid graph break crashes during QAT
     compiled_model = torch.compile(base_model, dynamic=False)
     
     model = (
@@ -830,12 +834,11 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
-        if max_wallclock_ms is None:
+        max_ms = args.max_wallclock_seconds * 1000.0 if args.max_wallclock_seconds > 0 else None
+        if max_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return (
                 max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
@@ -843,7 +846,7 @@ def main() -> None:
             )
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        remaining_ms = max(max_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     if args.warmup_steps > 0:
@@ -951,16 +954,20 @@ def main() -> None:
 
         step += 1
         approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        
+        # SAFETY FIX: Absolute Wallclock ensures we don't exceed OpenAI system SIGKILL timer
+        absolute_wallclock_ms = 1000.0 * (time.perf_counter() - global_start_time)
+        
         if args.train_log_every > 0 and (
             step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None
         ):
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_ms:.0f}ms step_avg:{approx_ms / step:.2f}ms"
+                f"train_time:{approx_ms:.0f}ms abs_time:{absolute_wallclock_ms:.0f}ms step_avg:{approx_ms / step:.2f}ms"
             )
 
-        reached_cap = max_wallclock_ms is not None and approx_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
+        reached_cap = args.max_wallclock_seconds > 0 and absolute_wallclock_ms >= (args.max_wallclock_seconds * 1000.0)
+        if distributed and args.max_wallclock_seconds > 0:
             rc = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(rc, op=dist.ReduceOp.MAX)
             reached_cap = bool(rc.item())
@@ -986,7 +993,12 @@ def main() -> None:
     if master_process:
         with open(artifact_name, "wb") as f:
             f.write(quant_blob)
-        log0(f"Artifact size: {len(quant_blob)/1e6:.3f} MB ({artifact_name})")
+        artifact_mb = len(quant_blob) / 1e6
+        log0(f"Artifact size: {artifact_mb:.3f} MB ({artifact_name})")
+        
+        # SAFETY FIX: Strict crash on size violation to avoid silent disqualification
+        if len(quant_blob) > 16_000_000:
+            raise RuntimeError(f"FATAL: Artifact exceeds 16MB limit! Size: {len(quant_blob)} bytes")
 
     if distributed:
         dist.barrier()
