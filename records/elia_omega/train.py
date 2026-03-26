@@ -1,5 +1,5 @@
 """
-Elia ꙮ Omega v5.1 — The Final Monolith (SOTA Killer)
+Elia ꙮ Omega v5.2 — The Final Monolith (SOTA Killer)
 MIT License — Copyright (c) 2026 Igor Labadin
 
 Architecture: ONE shared block (dim=1152) applied 24 times recurrently.
@@ -10,16 +10,14 @@ Key features:
   - dim=1152, 18 heads (head_dim=64), 6 KV heads, mlp_mult=3
   - vocab=8192 BPE (shorter sequences -> lower BPB vs 1024)
   - Exponential Skip Decay: x0 injection decays via Golden Ratio across depth
-  - Zero-Init DepthEmbedding: safe, perfectly symmetrical start for 24 depth personas
+  - Zero-Init DepthEmbedding: perfectly symmetrical start for 24 depth personas
   - LeakyReLU(0.5)^2 in MLP: no dead neurons across 24 recurrent passes
   - Rotary with pre-computed buffers (torch.compile friendly)
   - Int6 QAT (STE): weights trained aware of quantization since step 200
-  - QATEmbedding: tok_emb (40% of params) also QAT-aware, no save-time shock
-  - True int6 packing: 4 params -> 3 bytes (0.75 bytes/param)
-    -> ~20.9M params, ~14.6MB after compression (Safe <16MB limit)
+  - True int6 packing: 4 params -> 3 bytes -> ~20.9M params, ~14MB disk size
   - EMA weights (decay=0.999): smoother final checkpoint
-  - System survivability: 570s soft-stop via absolute wallclock, adaptive DDP gradient accumulation
-  - Precision Safety: Passthrough control tensors retain exact bfloat16/float32 dtype
+  - Cosine Time-Aware Warmdown: LR drops gracefully based on remaining wallclock
+  - System survivability: Preemptive 570s soft-stop, strict 16MB validation
 """
 
 from __future__ import annotations
@@ -70,10 +68,12 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 150))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    
+    # OOM FALLBACK: If CUDA Out of Memory occurs, lower train_batch_tokens to 262144
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     
-    # SAFETY FIX: Absolute landing strip to avoid SIGKILL
+    # SAFETY FIX: Absolute landing strip to guarantee saving before SIGKILL
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 570.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -197,6 +197,8 @@ class ModelEMA:
 # MUON OPTIMIZER
 # -----------------------------
 
+# SAFETY FIX: Forcing fullgraph for strict Newton-Schulz compilation speedup
+@torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -375,7 +377,6 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             continue
         if (t.numel() <= INT6_KEEP_FLOAT_MAX_NUMEL or
                 any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)):
-            # SAFETY FIX: Do not force float16 on passthrough parameters. Retain original exact dtype.
             kept = t.detach().cpu().contiguous()
             if t.dtype in {torch.float32, torch.bfloat16, torch.float16}:
                 passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -728,13 +729,11 @@ class EliaOmega(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
-    args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-
-    # SAFETY FIX: Absolute Wallclock initialization
+    # PREEMPTIVE SAFETY: Absolute Wallclock initialization
     global_start_time = time.perf_counter()
 
+    args = Hyperparameters()
+    
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank       = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -834,20 +833,21 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    # QUALITY FIX: Cosine Time-Aware Warmdown
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
-            return 1.0
+        if args.warmdown_iters <= 0: return 1.0
         max_ms = args.max_wallclock_seconds * 1000.0 if args.max_wallclock_seconds > 0 else None
-        if max_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return (
-                max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
-                if warmdown_start <= step < args.iterations else 1.0
-            )
+        if max_ms is None: return 1.0
+        
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        
+        if remaining_ms <= warmdown_ms:
+            progress = 1.0 - (remaining_ms / max(warmdown_ms, 1e-9))
+            progress = max(0.0, min(progress, 1.0))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
 
     if args.warmup_steps > 0:
         initial_model_state = {
@@ -876,17 +876,23 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     training_time_ms = 0.0
-    stop_after_step = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
 
     while True:
-        last_step = step == args.iterations or (
-            stop_after_step is not None and step >= stop_after_step
-        )
+        # PREEMPTIVE SAFETY FIX: Check absolute time BEFORE starting the heavy matrix math
+        absolute_wallclock_ms = 1000.0 * (time.perf_counter() - global_start_time)
+        time_is_up = args.max_wallclock_seconds > 0 and absolute_wallclock_ms >= (args.max_wallclock_seconds * 1000.0)
+        
+        if distributed:
+            tc = torch.tensor(int(time_is_up), device=device)
+            dist.all_reduce(tc, op=dist.ReduceOp.MAX)
+            time_is_up = bool(tc.item())
 
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        last_step = step == args.iterations or time_is_up
+
+        if last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
 
@@ -955,24 +961,16 @@ def main() -> None:
         step += 1
         approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         
-        # SAFETY FIX: Absolute Wallclock ensures we don't exceed OpenAI system SIGKILL timer
+        # Log absolute time so you can monitor the actual wallclock progression
         absolute_wallclock_ms = 1000.0 * (time.perf_counter() - global_start_time)
         
         if args.train_log_every > 0 and (
-            step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None
+            step <= 10 or step % args.train_log_every == 0
         ):
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_ms:.0f}ms abs_time:{absolute_wallclock_ms:.0f}ms step_avg:{approx_ms / step:.2f}ms"
             )
-
-        reached_cap = args.max_wallclock_seconds > 0 and absolute_wallclock_ms >= (args.max_wallclock_seconds * 1000.0)
-        if distributed and args.max_wallclock_seconds > 0:
-            rc = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(rc, op=dist.ReduceOp.MAX)
-            reached_cap = bool(rc.item())
-        if stop_after_step is None and reached_cap:
-            stop_after_step = step
 
     if ema is not None:
         ema.apply_to(base_model)
