@@ -1,15 +1,18 @@
 """
-Elia ꙮ Omega v7.0 «Naked Core» — Pure Compute Monolith
+Elia ꙮ Omega v7.1 «Naked Core» — Pure Compute Monolith
 MIT License — Copyright (c) 2026 Igor Labadin
 
 Architecture: ONE shared block (dim=1152) applied 24 times recurrently.
+v7.1 Updates: 
+  - Surgical DDP optimization using pure `model.no_sync()` context.
+  - Bulletproof gradient accumulation.
+
 v7.0 Naked Core Features (All bottlenecks burned out):
-  - 100% Static Graph for maximum `torch.compile` speedup (No dynamic layers, no EHSE logic).
-  - DNA Depth Bias: Low-rank (rank=16) factorization with Zero-Init constraint for perfect symmetry.
+  - 100% Static Graph for maximum `torch.compile` speedup.
+  - DNA Depth Bias: Low-rank (rank=16) factorization with Zero-Init constraint.
   - Safe DDP Dataloader: Thread-free, sequential reading relying on NVMe/OS page cache.
   - SwiGLU activation, Trainable Fibonacci Skip (x0_decay).
   - True int6 packing: 4 params -> 3 bytes -> ~20.9M params, ~14.6MB disk size.
-  - Bulletproof QAT Ignition outside the micro-step loop.
 """
 
 import copy
@@ -21,6 +24,7 @@ import random
 import time
 import uuid
 import zlib
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +59,7 @@ class Hyperparameters:
     val_stride = int(os.environ.get("VAL_STRIDE", 64))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 250)) # Increased for smoother landing
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 250))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
@@ -809,18 +813,20 @@ def main() -> None:
         for _ in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
-                if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                if x is None: continue 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    wl = model(x, y)
-                (wl * grad_scale).backward()
+                is_last_micro_step = (micro_step == grad_accum_steps - 1)
+                sync_context = model.no_sync() if (distributed and not is_last_micro_step) else contextlib.nullcontext()
+                
+                with sync_context:
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    if x is None: continue 
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        wl = model(x, y)
+                    (wl * grad_scale).backward()
             for opt in optimizers: opt.step()
             zero_grad_all()
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_opt_states, strict=True): opt.load_state_dict(state)
         zero_grad_all()
-        if distributed: model.require_backward_grad_sync = True
         
         # Reset loader
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -875,15 +881,18 @@ def main() -> None:
             if distributed: dist.barrier()
 
         for micro_step in range(grad_accum_steps):
-            if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            if x is None:
-                skipped_micro_steps += 1
-                continue
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            is_last_micro_step = (micro_step == grad_accum_steps - 1)
+            sync_context = model.no_sync() if (distributed and not is_last_micro_step) else contextlib.nullcontext()
+            
+            with sync_context:
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                if x is None:
+                    skipped_micro_steps += 1
+                    continue
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
 
         if skipped_micro_steps < grad_accum_steps:
             train_loss /= (grad_accum_steps - skipped_micro_steps)
